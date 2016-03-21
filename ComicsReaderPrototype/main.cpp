@@ -17,170 +17,9 @@
 
 */
 
-#include <SDL.h>
-#include <SDL_opengl.h>
 #include <vapoursynth/VapourSynth.h>
 #include <vapoursynth/VSScript.h>
-#include <cstdio>
-
-#ifdef _WIN32 || _WIN64
-#include <Shlwapi.h>
-#else
-
-#endif
-
-typedef unsigned char u8;
-typedef int32_t       s32;
-typedef uint32_t      u32;
-typedef float_t       r32;
-
-// Macros
-#define ArrayCount(a) (sizeof((a)) / sizeof((a)[0]))
-
-// Global variables
-static char g_vs_boilerplate[] = R"H(import vapoursynth as vs
-from os.path import abspath
-core = vs.get_core()
-core.std.LoadPlugin(abspath("vapoursynth-stbi.dll"))
-target_width = %d
-target_height = %d
-filename = r"%s"
-i = core.stb.Image(filename)
-)H";
-
-static char *g_filter_chain = nullptr;
-
-static char *g_archive_extensions[] = {
-    "zip", "7z", "rar", "cbz", "cbr"
-};
-
-#ifdef _WIN32 || _WIN64
-static char g_directory_separator = '\\';
-#else
-static char g_directory_seperator = '/';
-#endif
-
-static char *g_temp_dir_name = "crp";
-static u32 g_temp_dir_name_length = strlen(g_temp_dir_name);
-
-static char *g_temp_directory = nullptr;
-static u32 g_temp_directory_length;
-
-static s32 g_display_width;
-static s32 g_display_height;
-
-// Remember to free the string you get from this function!
-char *
-GetTempDirectory()
-{
-    char *directory;
-
-#ifdef _WIN32 || _WIN64
-    char windows_path[MAX_PATH];
-    // TODO: Will this mess up on non-English Windows installations?
-    u32 path_length = GetTempPathA(MAX_PATH, windows_path);
-    if (!path_length)
-    {
-        SDL_Log("Couldn't get temporary path: %d\n", GetLastError());
-        directory = nullptr;
-    }
-    else
-    {
-        u32 full_length = path_length + g_temp_dir_name_length + 1;
-        directory = (char *)calloc(full_length + 1, sizeof(char));
-        if (!directory)
-        {
-            SDL_Log("Couldn't allocate memory for the temporary path.");
-            return nullptr;
-        }
-        memcpy(directory, windows_path, path_length);
-        strcat(directory, g_temp_dir_name);
-        directory[full_length - 1] = g_directory_separator;
-    }
-#else
-    // TODO: GetTempDirectory is not implemented for non-Windows platforms yet
-    directory = nullptr;
-#endif
-
-    return directory;
-}
-
-// TODO: Better name?
-s32
-CopyFileToTemp(char *filename, char *temp_file_path)
-{
-    s32 result;
-
-#ifdef _WIN32 || _WIN64
-    result = CopyFileA(filename, temp_file_path, 0);
-#else
-    // TODO: Non-Windows copying
-#endif
-
-    return result;
-}
-
-s32
-FileExists(char *path)
-{
-    s32 result;
-
-#if _WIN32 || _WIN64
-    result = PathFileExistsA(path);
-#else
-    // TODO: Non-Windows file checking
-#endif
-
-    return result;
-}
-
-s32
-IsArchive(char *ext)
-{
-    for (s32 i = 0; i < ArrayCount(g_archive_extensions); ++i)
-    {
-        char *ext_check = g_archive_extensions[i];
-
-        while (*ext == *ext_check)
-        {
-            if (!*ext)
-                return 1;
-
-            ++ext;
-            ++ext_check;
-        }
-    }
-
-    return 0;
-}
-
-inline char *
-GetFilenameFromPath(char *path)
-{
-    char *filename;
-
-    char *slash = strrchr(path, g_directory_separator);
-    if (!slash || slash == path)
-        filename = path;
-    else
-        filename = slash + 1;
-
-    return filename;
-}
-
-inline char *
-GetFileExtension(char *filename)
-{
-    char *ext;
-
-    char *dot = strrchr(filename, '.');
-    if (!dot || dot == filename)
-        ext = "";
-    else
-        ext = dot + 1;
-
-    return ext;
-}
+#include "platform.h"
 
 s32
 OpenFilterChain(char *chain_filename)
@@ -190,7 +29,7 @@ OpenFilterChain(char *chain_filename)
     FILE *chain_file = fopen(chain_filename, "r");
     if (!chain_file)
     {
-        // TODO: we messed up
+        SDL_Log("Couldn't open the filter chain file %s.\n", chain_filename);
         return 0;
     }
 
@@ -212,18 +51,56 @@ OpenFilterChain(char *chain_filename)
     return length;
 }
 
-typedef struct
+u8 *
+GenerateTextureBuffer(VSNodeRef *node, s32 *image_width, s32 *image_height)
 {
-    SDL_Renderer *renderer;
-    SDL_Texture *texture;
-    SDL_Rect *dest_rect;
-    s32 image_width;
-    s32 image_height;
-    s32 mouse_button0_held;
-    r32 zoom;
-} State;
+    u8 *texture_buffer;
 
-inline void
+    char errMsg[1024];
+    const VSFrameRef *frame;
+    frame = g_vsapi->getFrame(0, node, errMsg, sizeof errMsg);
+
+    if (!frame)
+    {
+        SDL_Log("Error getting frame from VapourSynth:\n%s", errMsg);
+        return nullptr;
+    }
+
+    s32 width = g_vsapi->getFrameWidth(frame, 0);
+    *image_width = width;
+    s32 height = g_vsapi->getFrameHeight(frame, 0);
+    *image_height = height;
+
+    s32 stride = g_vsapi->getStride(frame, 0);
+    const u8 *r_ptr = g_vsapi->getReadPtr(frame, 0);
+    const u8 *g_ptr = g_vsapi->getReadPtr(frame, 1);
+    const u8 *b_ptr = g_vsapi->getReadPtr(frame, 2);
+
+    // NOTE: The 3 here refers to R G B
+    texture_buffer = (u8 *)malloc((width * 3) * height);
+    u8 *texture_write = (u8 *)texture_buffer;
+
+    for (s32 y = 0; y < height; ++y)
+    {
+        for (s32 x = 0; x < width; ++x)
+        {
+            // TODO: This might not play nice with endianness?
+            *texture_write++ = b_ptr[x];
+            *texture_write++ = g_ptr[x];
+            *texture_write++ = r_ptr[x];
+        }
+
+        r_ptr += stride;
+        g_ptr += stride;
+        b_ptr += stride;
+    }
+
+    g_vsapi->freeFrame(frame);
+
+    return texture_buffer;
+}
+
+void
 UpdateScaling(State *s)
 {
     s32 scaled_width = s->image_width * s->zoom;
@@ -337,11 +214,130 @@ HandleEvents(State *s)
 void
 RenderFrame(State *s)
 {
-    SDL_RenderClear(s->renderer);
+    // TODO: Lock g_renderer
+    SDL_RenderClear(g_renderer);
 
-    SDL_RenderCopy(s->renderer, s->texture, nullptr, s->dest_rect);
+    SDL_RenderCopy(g_renderer, s->texture, nullptr, s->dest_rect);
 
-    SDL_RenderPresent(s->renderer);
+    SDL_RenderPresent(g_renderer);
+}
+
+static volatile s32 g_renderer_locked = 0;
+
+typedef struct
+{
+    s32 index;
+    char *file_path;
+} ProcessImageData;
+
+typedef struct
+{
+    u8 processed = 0;
+    SDL_Texture *texture = nullptr;
+    s32 width = 0;
+    s32 height = 0;
+} ProcessedImage;
+
+static s32 g_num_images;
+static ProcessedImage *g_images;
+static volatile s32 g_images_locked = 0;
+
+static s32
+ProcessImage(void *thread_data)
+{
+    ProcessImageData *d = (ProcessImageData *)thread_data;
+    s32 exit_code = 0;
+
+    s32 script_buffer_length = strlen(g_vs_boilerplate) + strlen(d->file_path) + g_chain_length + 4;
+    char *script_buffer = (char *)calloc(script_buffer_length, sizeof(char));
+    if (!script_buffer)
+    {
+        SDL_Log("Couldn't allocate enough memory for the generated filter chain.\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    s32 written = sprintf(script_buffer, g_vs_boilerplate, g_display_width, g_display_height, d->file_path);
+    if (!written)
+    {
+        SDL_Log("Couldn't generate the filter chain header.\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    strcat(script_buffer, g_filter_chain);
+
+    VSScript *se = nullptr;
+    if (vsscript_evaluateScript(&se, script_buffer, g_filter_chain, 0))
+    {
+        SDL_Log("Script evaluation failed:\n%s", vsscript_getError(se));
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    free(script_buffer);
+
+    VSNodeRef *node = vsscript_getOutput(se, 0);
+    if (!node)
+    {
+        SDL_Log("Failed to retrieve VapourSynth output node. Make sure that you are calling set_output().\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    const VSVideoInfo *vi = g_vsapi->getVideoInfo(node);
+    if (!vi->numFrames)
+    {
+        SDL_Log("The VapourSynth clip is of unknown length. Please check your chain for errors.\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    s32 image_width;
+    s32 image_height;
+    u8 *texture_buffer = GenerateTextureBuffer(node, &image_width, &image_height);
+    if (!texture_buffer)
+    {
+        SDL_Log("Couldn't generate a texture from the filter chain.\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    // NOTE: We assume 3 bytes per sample here.
+    auto surface = SDL_CreateRGBSurfaceFrom(texture_buffer,
+        image_width, image_height,
+        24, image_width * 3,
+        0, 0, 0, 0);
+    
+    SDL_Texture *texture = nullptr;
+    do
+    {
+        auto l = MT_CompareExchange(&g_renderer_locked, 1, 0);
+        if (!l)
+        {
+            texture = SDL_CreateTextureFromSurface(g_renderer, surface);
+            l = MT_Exchange(&g_renderer_locked, 0);
+        }
+    } while (!texture);
+    
+    // TODO: Lock g_images
+    ProcessedImage *image = &g_images[d->index];
+    image->texture = texture;
+    image->width = image_width;
+    image->height = image_height;
+    image->processed = 1;
+
+cleanup:
+    if (node)
+        g_vsapi->freeNode(node);
+    if (se)
+        vsscript_freeScript(se);
+    if (surface)
+        SDL_FreeSurface(surface);
+    if (texture_buffer)
+        free(texture_buffer);
+
+    return exit_code;
 }
 
 s32
@@ -353,13 +349,15 @@ main(s32 argc, char* argv[])
         return 1;
     }
 
-    // TODO: Handle command-line arguments
-
     if (!FileExists(argv[1]))
     {
         SDL_Log("%s doesn't exist.\n", argv[1]);
         return 1;
     }
+    
+    // TODO: Handle command-line arguments
+
+    s32 exit_code = 0;
 
     if (SDL_Init(SDL_INIT_VIDEO))
     {
@@ -385,13 +383,12 @@ main(s32 argc, char* argv[])
         return 1;
     }
 
-    const VSAPI *vsapi = vsscript_getVSApi();
-    if (!vsapi)
+    g_vsapi = vsscript_getVSApi();
+    if (!g_vsapi)
     {
         SDL_Log("Something weird happened with getVSApi, dunno\n");
-        vsscript_finalize();
-        SDL_Quit();
-        return 1;
+        exit_code = 1;
+        goto cleanup;
     }
 
     SDL_Window *window = SDL_CreateWindow("Comic Reader Prototype",
@@ -400,204 +397,102 @@ main(s32 argc, char* argv[])
     if (!window)
     {
         SDL_Log("Couldn't create SDL2 window: %s\n", SDL_GetError());
-        vsscript_finalize();
-        SDL_Quit();
-        return 1;
+        exit_code = 1;
+        goto cleanup;
     }
 
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, 0, SDL_RENDERER_ACCELERATED);
-    if (!renderer)
+    g_renderer = SDL_CreateRenderer(window, 0, SDL_RENDERER_ACCELERATED);
+    if (!g_renderer)
     {
         SDL_Log("Couldn't create SDL2 renderer: %s\n", SDL_GetError());
-        SDL_DestroyWindow(window);
-        vsscript_finalize();
-        SDL_Quit();
-        return 1;
+        exit_code = 1;
+        goto cleanup;
     }
     
-    SDL_RenderClear(renderer);
-    SDL_RenderPresent(renderer);
-
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+
+    SDL_RenderClear(g_renderer);
+    SDL_RenderPresent(g_renderer);
 
     g_temp_directory = GetTempDirectory();
     if (!g_temp_directory)
     {
         // TODO: Handle not being able to get the temporary path.
+        SDL_Log("Couldn't get the temporary path.\n");
+        exit_code = 1;
+        goto cleanup;
     }
     g_temp_directory_length = strlen(g_temp_directory);
 
-    char *DEBUG_target_filename = "temp.file";
-    char *target_file;
-    char *target_file_path;
+    char *default_chain_name = "chain.vpy";
+
+    g_chain_length = OpenFilterChain(default_chain_name);
+    if (!g_chain_length)
     {
-        s32 copied = 0;
-
-        char *filename = argv[1];
-        //target_file = DEBUG_target_filename;
-        target_file = GetFilenameFromPath(filename);
-        char *ext = GetFileExtension(filename);
-
-        u32 target_file_length = strlen(target_file);
-
-        target_file_path = (char *)calloc(g_temp_directory_length + target_file_length + 1, sizeof(char));
-        if (!target_file_path)
-        {
-            // TODO: Error: couldn't allocate enough memory for the script buffer.
-        }
-        memcpy(target_file_path, g_temp_directory, g_temp_directory_length);
-        strcat(target_file_path, target_file);
-
-        if (IsArchive(ext))
-        {
-            // TODO: Handle archives
-        }
-        else
-        {
-            copied = CopyFileToTemp(filename, target_file_path);
-        }
-
-        if (!copied)
-        {
-            SDL_Log("Couldn't copy %s to temp folder.\n", target_file);
-
-            SDL_DestroyRenderer(renderer);
-            SDL_DestroyWindow(window);
-            vsscript_finalize();
-            SDL_Quit();
-            return 1;
-        }
+        SDL_Log("Couldn't open the filter chain file %s\n", default_chain_name);
+        exit_code = 1;
+        goto cleanup;
     }
 
-    s32 chain_length = OpenFilterChain("chain.vpy");
-    if (!chain_length)
+    char *source_filename = argv[1];
+    char *ext = GetFileExtension(source_filename);
+    char *target_file_path = source_filename;
+
+    // TODO: Determine how many threads we can use
+
+    if (IsArchive(ext))
     {
-        // TODO: Something here
+        // TODO: Handle archives. Spawn a bunch of threads wooooo
     }
-
-    s32 script_buffer_length = strlen(g_vs_boilerplate) + strlen(target_file_path) + chain_length + 4;
-    char *script_buffer = (char *)calloc(script_buffer_length, sizeof(char));
-    if (!script_buffer)
+    else
     {
-        // TODO: Error: couldn't allocate enough memory for the script buffer.
+        g_num_images = 1;
+        g_images = (ProcessedImage *)calloc(g_num_images, sizeof(ProcessedImage));
+        ProcessedImage *i = &g_images[0];
+        i->processed = 0;
+
+        ProcessImageData thread_data = {};
+        thread_data.index = 0;
+        thread_data.file_path = target_file_path;
+
+        // TODO: Keep the thread handle around?
+        SDL_CreateThread(ProcessImage, "ProcessImage", &thread_data);
     }
-    s32 written = sprintf(script_buffer, g_vs_boilerplate, g_display_width, g_display_height, target_file_path);
-    if (!written)
-    {
-        // TODO: Something went wrong here  
-    }
-    strcat(script_buffer, g_filter_chain);
-
-    VSScript *se = nullptr;
-    if (vsscript_evaluateScript(&se, script_buffer, "chain.vpy", 0))
-    {
-        SDL_Log("Script evaluation failed:\n%s", vsscript_getError(se));
-        vsscript_freeScript(se);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        vsscript_finalize();
-        SDL_Quit();
-        return 1;
-    }
-
-    free(script_buffer);
-    free(target_file_path);
-
-    VSNodeRef *node = vsscript_getOutput(se, 0);
-    if (!node)
-    {
-        SDL_Log("Failed to retrieve VapourSynth output node. Make sure that you are calling set_output().\n");
-        vsscript_freeScript(se);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        vsscript_finalize();
-        SDL_Quit();
-        return 1;
-    }
-
-    const VSVideoInfo *vi = vsapi->getVideoInfo(node);
-    if (!vi->numFrames)
-    {
-        SDL_Log("The VapourSynth clip is of unknown length. Please check your chain for errors.\n");
-        vsapi->freeNode(node);
-        vsscript_freeScript(se);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        vsscript_finalize();
-        SDL_Quit();
-        return 1;
-    }
-
-    s32 image_width;
-    s32 image_height;
-    u8 *texture_buffer;
-    {
-        char errMsg[1024];
-        const VSFrameRef *frame;
-        frame = vsapi->getFrame(0, node, errMsg, sizeof errMsg);
-
-        if (!frame)
-        {
-            SDL_Log("Error getting frame from VapourSynth:\n%s", errMsg);
-
-            vsapi->freeNode(node);
-            vsscript_freeScript(se);
-            SDL_DestroyRenderer(renderer);
-            SDL_DestroyWindow(window);
-            vsscript_finalize();
-            SDL_Quit();
-            return 1;
-        }
-        
-        image_width = vsapi->getFrameWidth(frame, 0);
-        image_height = vsapi->getFrameHeight(frame, 0);
-
-        s32 stride = vsapi->getStride(frame, 0);
-        const u8 *r_ptr = vsapi->getReadPtr(frame, 0);
-        const u8 *g_ptr = vsapi->getReadPtr(frame, 1);
-        const u8 *b_ptr = vsapi->getReadPtr(frame, 2);
-
-        // NOTE: The 3 here refers to R G B
-        texture_buffer = (u8 *)malloc((image_width * 3) * image_height);
-        u8 *texture_write = (u8 *)texture_buffer;
-
-        for (s32 y = 0; y < image_height; ++y)
-        {
-            for (s32 x = 0; x < image_width; ++x)
-            {
-                // TODO: This might not play nice with endianness?
-                *texture_write++ = b_ptr[x];
-                *texture_write++ = g_ptr[x];
-                *texture_write++ = r_ptr[x];
-            }
-
-            r_ptr += stride;
-            g_ptr += stride;
-            b_ptr += stride;
-        }
-
-        vsapi->freeFrame(frame);
-    }
-
-    // NOTE: We assume 3 bytes per sample here.
-    auto surface = SDL_CreateRGBSurfaceFrom(texture_buffer, 
-                                            image_width, image_height, 
-                                            24, image_width * 3, 
-                                            0, 0, 0, 0);
-    auto texture = SDL_CreateTextureFromSurface(renderer, surface);
     
-    SDL_FreeSurface(surface);
-    free(texture_buffer);
+    s32 processing = 1;
+    while (processing)
+    {
+        // TODO: In here, we'll show a fancy loading thing or something.
+        // TODO: And also, like, actually do progress checking.
+        auto l = MT_CompareExchange(&g_renderer_locked, 1, 0);
+        if (!l)
+        {
+            SDL_RenderClear(g_renderer);
+            SDL_RenderPresent(g_renderer);
+
+            l = MT_Exchange(&g_renderer_locked, 0);
+        }
+
+        // TODO: Lock g_images. And, you know, not do progress checking like *this*.
+        //       (Actually, for the first image, this might be fine)
+        if (g_images[0].processed)
+        {
+            processing = 0;
+        }
+    }
+
+    s32 current_index = 0;
+    ProcessedImage *image = &g_images[current_index];
 
     r32 zoom = 1.0f;
 
-    s32 scaled_width = image_width;
-    s32 scaled_height = image_height;
+    s32 scaled_width = image->width;
+    s32 scaled_height = image->height;
     {
         if (scaled_height > g_display_height)
         {
-            zoom = g_display_height / (r32)image_height;
-            scaled_width = image_width * zoom;
+            zoom = g_display_height / (r32)image->height;
+            scaled_width = image->width * zoom;
             scaled_height = g_display_height;
         }
     }
@@ -607,9 +502,9 @@ main(s32 argc, char* argv[])
     SDL_Rect display_rect = { target_x, 0, scaled_width, scaled_height };
 
     State state = {
-        renderer, texture,
+        image->texture,
         &display_rect,
-        image_width, image_height,
+        image->width, image->height,
         0,
         zoom
     };
@@ -622,18 +517,22 @@ main(s32 argc, char* argv[])
         RenderFrame(&state);
     }
 
-    // TODO: Remove temp file
+    // TODO: Remove temp files
 
-    vsapi->freeNode(node);
-    vsscript_freeScript(se);
+cleanup:
+    if (g_images)
+        free(g_images);
     if (g_filter_chain)
         free(g_filter_chain);
     if (g_temp_directory)
         free(g_temp_directory);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
+    if (g_renderer)
+        SDL_DestroyRenderer(g_renderer);
+    if (window)
+        SDL_DestroyWindow(window);
+
     vsscript_finalize();
     SDL_Quit();
 
-    return 0;
+    return exit_code;
 }
