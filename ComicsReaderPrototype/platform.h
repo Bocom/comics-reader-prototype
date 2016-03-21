@@ -15,7 +15,10 @@ typedef int32_t       s32;
 typedef uint32_t      u32;
 typedef float_t       r32;
 
+/////////
 // Macros
+/////////
+
 #define ArrayCount(a) (sizeof((a)) / sizeof((a)[0]))
 
 #ifdef _WIN32 || _WIN64
@@ -27,8 +30,43 @@ typedef float_t       r32;
 #define MT_Exchange(ptr, value) __sync_lock_test_and_set((ptr), (value))
 #endif
 
-// Global variables
-static char g_vs_boilerplate[] = R"H(import vapoursynth as vs
+/////////////
+// Structures
+/////////////
+
+// The state of the program
+typedef struct
+{
+    SDL_Texture *texture;
+    SDL_Rect *dest_rect;
+    s32 current_index;
+    s32 image_width;
+    s32 image_height;
+    s32 mouse_button0_held;
+    r32 zoom;
+} State;
+
+// Worker thread data
+typedef struct
+{
+    s32 index;
+    char *file_path;
+} ProcessImageData;
+
+// Image data
+typedef struct
+{
+    u8 processed = 0;
+    SDL_Texture *texture = nullptr;
+    s32 width = 0;
+    s32 height = 0;
+} ProcessedImage;
+
+//////////
+// Globals
+//////////
+
+static char *g_vs_boilerplate = R"H(import vapoursynth as vs
 from os.path import abspath
 core = vs.get_core()
 core.std.LoadPlugin(abspath("vapoursynth-stbi.dll"))
@@ -61,20 +99,17 @@ static char *g_temp_dir_name = "crp";
 static u32 g_temp_dir_name_length = strlen(g_temp_dir_name);
 
 static SDL_Renderer *g_renderer;
+static volatile s32 g_renderer_locked = 0;
+
 static const VSAPI *g_vsapi;
 
-// Structures
-typedef struct
-{
-    SDL_Texture *texture;
-    SDL_Rect *dest_rect;
-    s32 image_width;
-    s32 image_height;
-    s32 mouse_button0_held;
-    r32 zoom;
-} State;
+static s32 g_num_images;
+static ProcessedImage *g_images;
+static volatile s32 g_images_locked = 0;
 
+////////////
 // Functions
+////////////
 
 // Remember to free the string you get from this function!
 static char *
@@ -83,6 +118,7 @@ GetTempDirectory()
     char *directory;
 
 #ifdef _WIN32 || _WIN64
+    // TODO: MAX_PATH is a bit weird since it doesn't account for Unicode-style paths
     char windows_path[MAX_PATH];
     // TODO: Will this mess up on non-English Windows installations?
     u32 path_length = GetTempPathA(MAX_PATH, windows_path);
@@ -110,21 +146,6 @@ GetTempDirectory()
 #endif
 
     return directory;
-}
-
-// TODO: Better name?
-static s32
-CopyFileToTemp(char *filename, char *temp_file_path)
-{
-    s32 result;
-
-#ifdef _WIN32 || _WIN64
-    result = CopyFileA(filename, temp_file_path, 0);
-#else
-    // TODO: Non-Windows copying
-#endif
-
-    return result;
 }
 
 static s32

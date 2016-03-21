@@ -51,6 +51,7 @@ OpenFilterChain(char *chain_filename)
     return length;
 }
 
+// TODO: Do we need to lock g_vsapi?
 u8 *
 GenerateTextureBuffer(VSNodeRef *node, s32 *image_width, s32 *image_height)
 {
@@ -222,26 +223,6 @@ RenderFrame(State *s)
     SDL_RenderPresent(g_renderer);
 }
 
-static volatile s32 g_renderer_locked = 0;
-
-typedef struct
-{
-    s32 index;
-    char *file_path;
-} ProcessImageData;
-
-typedef struct
-{
-    u8 processed = 0;
-    SDL_Texture *texture = nullptr;
-    s32 width = 0;
-    s32 height = 0;
-} ProcessedImage;
-
-static s32 g_num_images;
-static ProcessedImage *g_images;
-static volatile s32 g_images_locked = 0;
-
 static s32
 ProcessImage(void *thread_data)
 {
@@ -312,11 +293,11 @@ ProcessImage(void *thread_data)
     SDL_Texture *texture = nullptr;
     do
     {
-        auto l = MT_CompareExchange(&g_renderer_locked, 1, 0);
-        if (!l)
+        auto locked = MT_CompareExchange(&g_renderer_locked, 1, 0);
+        if (!locked)
         {
             texture = SDL_CreateTextureFromSurface(g_renderer, surface);
-            l = MT_Exchange(&g_renderer_locked, 0);
+            locked = MT_Exchange(&g_renderer_locked, 0);
         }
     } while (!texture);
     
@@ -436,7 +417,6 @@ main(s32 argc, char* argv[])
 
     char *source_filename = argv[1];
     char *ext = GetFileExtension(source_filename);
-    char *target_file_path = source_filename;
 
     // TODO: Determine how many threads we can use
 
@@ -446,6 +426,8 @@ main(s32 argc, char* argv[])
     }
     else
     {
+        // TODO: Folder scanning logic
+
         g_num_images = 1;
         g_images = (ProcessedImage *)calloc(g_num_images, sizeof(ProcessedImage));
         ProcessedImage *i = &g_images[0];
@@ -453,7 +435,7 @@ main(s32 argc, char* argv[])
 
         ProcessImageData thread_data = {};
         thread_data.index = 0;
-        thread_data.file_path = target_file_path;
+        thread_data.file_path = source_filename;
 
         // TODO: Keep the thread handle around?
         SDL_CreateThread(ProcessImage, "ProcessImage", &thread_data);
@@ -464,13 +446,13 @@ main(s32 argc, char* argv[])
     {
         // TODO: In here, we'll show a fancy loading thing or something.
         // TODO: And also, like, actually do progress checking.
-        auto l = MT_CompareExchange(&g_renderer_locked, 1, 0);
-        if (!l)
+        auto locked = MT_CompareExchange(&g_renderer_locked, 1, 0);
+        if (!locked)
         {
             SDL_RenderClear(g_renderer);
             SDL_RenderPresent(g_renderer);
 
-            l = MT_Exchange(&g_renderer_locked, 0);
+            locked = MT_Exchange(&g_renderer_locked, 0);
         }
 
         // TODO: Lock g_images. And, you know, not do progress checking like *this*.
